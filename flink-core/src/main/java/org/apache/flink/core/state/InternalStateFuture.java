@@ -20,8 +20,7 @@ package org.apache.flink.core.state;
 
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.api.common.state.v2.StateFuture;
-
-import java.util.function.Consumer;
+import org.apache.flink.util.function.ThrowingConsumer;
 
 /**
  * The Internal definition of {@link StateFuture}, add some method that will be used by framework.
@@ -38,5 +37,5 @@ public interface InternalStateFuture<T> extends StateFuture<T> {
      *
      * @param action the action to perform.
      */
-    void thenSyncAccept(Consumer<? super T> action);
+    void thenSyncAccept(ThrowingConsumer<? super T, ? extends Exception> action);
 }

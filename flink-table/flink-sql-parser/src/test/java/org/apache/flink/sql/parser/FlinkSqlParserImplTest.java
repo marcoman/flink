@@ -59,8 +59,10 @@ class FlinkSqlParserImplTest extends SqlParserTest {
     @Test
     void testDescribeCatalog() {
         sql("describe catalog a").ok("DESCRIBE CATALOG `A`");
+        sql("describe catalog extended a").ok("DESCRIBE CATALOG EXTENDED `A`");
 
         sql("desc catalog a").ok("DESCRIBE CATALOG `A`");
+        sql("desc catalog extended a").ok("DESCRIBE CATALOG EXTENDED `A`");
     }
 
     @Test
@@ -2951,6 +2953,12 @@ class FlinkSqlParserImplTest extends SqlParserTest {
                 .fails("WITH DRAIN could only be used after WITH SAVEPOINT.");
         sql("STOP JOB 'myjob' ^WITH DRAIN^ WITH SAVEPOINT")
                 .fails("WITH DRAIN could only be used after WITH SAVEPOINT.");
+    }
+
+    @Test
+    void testDescribeJob() {
+        sql("DESCRIBE JOB 'myjob'").ok("DESCRIBE JOB 'myjob'");
+        sql("DESC JOB 'myjob'").ok("DESCRIBE JOB 'myjob'");
     }
 
     @Test

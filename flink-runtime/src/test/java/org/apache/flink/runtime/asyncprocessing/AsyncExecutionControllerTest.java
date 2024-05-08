@@ -18,31 +18,36 @@
 
 package org.apache.flink.runtime.asyncprocessing;
 
+import org.apache.flink.api.common.operators.MailboxExecutor;
+import org.apache.flink.api.common.state.v2.State;
 import org.apache.flink.api.common.typeinfo.BasicTypeInfo;
 import org.apache.flink.api.common.typeutils.base.IntSerializer;
+import org.apache.flink.core.state.StateFutureImpl.AsyncFrameworkExceptionHandler;
 import org.apache.flink.core.state.StateFutureUtils;
+import org.apache.flink.runtime.concurrent.ManuallyTriggeredScheduledExecutorService;
 import org.apache.flink.runtime.mailbox.SyncMailboxExecutor;
 import org.apache.flink.runtime.state.AsyncKeyedStateBackend;
-import org.apache.flink.runtime.state.CheckpointableKeyedStateBackend;
-import org.apache.flink.runtime.state.OperatorStateBackend;
 import org.apache.flink.runtime.state.StateBackend;
+import org.apache.flink.runtime.state.StateBackendTestUtils;
 import org.apache.flink.runtime.state.v2.InternalValueState;
 import org.apache.flink.runtime.state.v2.ValueStateDescriptor;
+import org.apache.flink.util.FlinkRuntimeException;
 import org.apache.flink.util.Preconditions;
+import org.apache.flink.util.function.ThrowingRunnable;
 
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.util.HashMap;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Supplier;
 
 import static org.assertj.core.api.AssertionsForClassTypes.assertThat;
 
 /** Test for {@link AsyncExecutionController}. */
 class AsyncExecutionControllerTest {
     AsyncExecutionController aec;
-    TestUnderlyingState underlyingState;
     AtomicInteger output;
     TestValueState valueState;
 
@@ -61,16 +66,54 @@ class AsyncExecutionControllerTest {
                         .thenAccept(val -> output.set(val));
             };
 
-    @BeforeEach
-    void setup() {
-        aec = new AsyncExecutionController<>(new SyncMailboxExecutor(), createStateExecutor());
-        underlyingState = new TestUnderlyingState();
-        valueState = new TestValueState(aec, underlyingState);
+    void setup(
+            int batchSize,
+            long timeout,
+            int maxInFlight,
+            MailboxExecutor mailboxExecutor,
+            AsyncFrameworkExceptionHandler exceptionHandler) {
+        StateExecutor stateExecutor = new TestStateExecutor();
+        ValueStateDescriptor<Integer> stateDescriptor =
+                new ValueStateDescriptor<>("test-value-state", BasicTypeInfo.INT_TYPE_INFO);
+        Supplier<State> stateSupplier =
+                () -> new TestValueState(aec, new TestUnderlyingState(), stateDescriptor);
+        StateBackend testAsyncStateBackend =
+                StateBackendTestUtils.buildAsyncStateBackend(stateSupplier, stateExecutor);
+        assertThat(testAsyncStateBackend.supportsAsyncKeyedStateBackend()).isTrue();
+        AsyncKeyedStateBackend asyncKeyedStateBackend;
+        try {
+            asyncKeyedStateBackend = testAsyncStateBackend.createAsyncKeyedStateBackend(null);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+        aec =
+                new AsyncExecutionController<>(
+                        mailboxExecutor,
+                        exceptionHandler,
+                        stateExecutor,
+                        128,
+                        batchSize,
+                        timeout,
+                        maxInFlight);
+        asyncKeyedStateBackend.setup(aec);
+
+        try {
+            valueState = asyncKeyedStateBackend.createState(stateDescriptor);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+
         output = new AtomicInteger();
     }
 
     @Test
     void testBasicRun() {
+        setup(
+                100,
+                10000L,
+                1000,
+                new SyncMailboxExecutor(),
+                new TestAsyncFrameworkExceptionHandler());
         // ============================ element1 ============================
         String record1 = "key1-r1";
         String key1 = "key1";
@@ -179,6 +222,12 @@ class AsyncExecutionControllerTest {
 
     @Test
     void testRecordsRunInOrder() {
+        setup(
+                100,
+                10000L,
+                1000,
+                new SyncMailboxExecutor(),
+                new TestAsyncFrameworkExceptionHandler());
         // Record1 and record3 have the same key, record2 has a different key.
         // Record2 should be processed before record3.
 
@@ -237,31 +286,14 @@ class AsyncExecutionControllerTest {
 
     @Test
     void testInFlightRecordControl() {
-        final int batchSize = 5;
-        final int maxInFlight = 10;
-        aec =
-                new AsyncExecutionController<>(
-                        new SyncMailboxExecutor(), new TestStateExecutor(), batchSize, maxInFlight);
-        valueState = new TestValueState(aec, underlyingState);
-
-        AtomicInteger output = new AtomicInteger();
-        Runnable userCode =
-                () -> {
-                    valueState
-                            .asyncValue()
-                            .thenCompose(
-                                    val -> {
-                                        int updated = (val == null ? 1 : (val + 1));
-                                        return valueState
-                                                .asyncUpdate(updated)
-                                                .thenCompose(
-                                                        o ->
-                                                                StateFutureUtils.completedFuture(
-                                                                        updated));
-                                    })
-                            .thenAccept(val -> output.set(val));
-                };
-
+        int batchSize = 5;
+        int maxInFlight = 10;
+        setup(
+                batchSize,
+                10000L,
+                maxInFlight,
+                new SyncMailboxExecutor(),
+                new TestAsyncFrameworkExceptionHandler());
         // For records with different keys, the in-flight records is controlled by batch size.
         for (int round = 0; round < 10; round++) {
             for (int i = 0; i < batchSize; i++) {
@@ -304,6 +336,12 @@ class AsyncExecutionControllerTest {
 
     @Test
     public void testSyncPoint() {
+        setup(
+                1000,
+                10000L,
+                6000,
+                new SyncMailboxExecutor(),
+                new TestAsyncFrameworkExceptionHandler());
         AtomicInteger counter = new AtomicInteger(0);
 
         // Test the sync point processing without a key occupied.
@@ -346,10 +384,208 @@ class AsyncExecutionControllerTest {
         recordContext2.release();
     }
 
-    private StateExecutor createStateExecutor() {
-        TestAsyncStateBackend testAsyncStateBackend = new TestAsyncStateBackend();
-        assertThat(testAsyncStateBackend.supportsAsyncKeyedStateBackend()).isTrue();
-        return testAsyncStateBackend.createAsyncKeyedStateBackend(null).createStateExecutor();
+    @Test
+    void testBufferTimeout() {
+        int batchSize = 5;
+        int timeout = 1000;
+        setup(
+                batchSize,
+                timeout,
+                1000,
+                new SyncMailboxExecutor(),
+                new TestAsyncFrameworkExceptionHandler());
+        ManuallyTriggeredScheduledExecutorService scheduledExecutor =
+                new ManuallyTriggeredScheduledExecutorService();
+        aec.stateRequestsBuffer.scheduledExecutor = scheduledExecutor;
+        Runnable userCode = () -> valueState.asyncValue();
+
+        // ------------ basic timeout -------------------
+        for (int i = 0; i < batchSize - 1; i++) {
+            String record = String.format("key%d-r%d", i, i);
+            String key = String.format("key%d", batchSize + i);
+            RecordContext<String> recordContext = aec.buildContext(record, key);
+            aec.setCurrentContext(recordContext);
+            userCode.run();
+        }
+        assertThat(aec.stateRequestsBuffer.currentSeq.get()).isEqualTo(0);
+        assertThat(aec.stateRequestsBuffer.scheduledSeq.get()).isEqualTo(0);
+        assertThat(aec.stateRequestsBuffer.currentScheduledFuture.isDone()).isFalse();
+        assertThat(aec.inFlightRecordNum.get()).isEqualTo(batchSize - 1);
+        assertThat(aec.stateRequestsBuffer.activeQueueSize()).isEqualTo(batchSize - 1);
+        assertThat(aec.stateRequestsBuffer.blockingQueueSize()).isEqualTo(0);
+
+        // buffer timeout, trigger
+        scheduledExecutor.triggerNonPeriodicScheduledTasks();
+        assertThat(aec.stateRequestsBuffer.activeQueueSize()).isEqualTo(0);
+        assertThat(aec.stateRequestsBuffer.currentScheduledFuture.isDone()).isTrue();
+        assertThat(aec.inFlightRecordNum.get()).isEqualTo(0);
+        assertThat(aec.stateRequestsBuffer.currentSeq.get()).isEqualTo(1);
+        assertThat(aec.stateRequestsBuffer.scheduledSeq.get()).isEqualTo(0);
+
+        // ----------------- oldest state request timeout ------------------
+        // r5 and r6 should be triggered due to r5 exceeding timeout
+        String record5 = "key5-r5";
+        String key5 = "key5";
+        RecordContext<String> recordContext5 = aec.buildContext(record5, key5);
+        aec.setCurrentContext(recordContext5);
+        // execute user code
+        userCode.run();
+        assertThat(aec.inFlightRecordNum.get()).isEqualTo(1);
+        assertThat(aec.stateRequestsBuffer.activeQueueSize()).isEqualTo(1);
+        assertThat(aec.stateRequestsBuffer.currentScheduledFuture.isDone()).isFalse();
+        ScheduledFuture<Void> scheduledFuture = aec.stateRequestsBuffer.currentScheduledFuture;
+        String record6 = "key6-r6";
+        String key6 = "key6";
+        RecordContext<String> recordContext6 = aec.buildContext(record6, key6);
+        aec.setCurrentContext(recordContext6);
+        // execute user code
+        userCode.run();
+        assertThat(aec.inFlightRecordNum.get()).isEqualTo(2);
+        assertThat(aec.stateRequestsBuffer.activeQueueSize()).isEqualTo(2);
+
+        assertThat(scheduledExecutor.getActiveNonPeriodicScheduledTask().size()).isEqualTo(1);
+        assertThat(scheduledExecutor.getAllNonPeriodicScheduledTask().size()).isEqualTo(1);
+        assertThat(aec.stateRequestsBuffer.currentSeq.get()).isEqualTo(1);
+        assertThat(aec.stateRequestsBuffer.scheduledSeq.get()).isEqualTo(1);
+        scheduledExecutor.triggerNonPeriodicScheduledTasks();
+
+        assertThat(aec.inFlightRecordNum.get()).isEqualTo(0);
+        assertThat(aec.stateRequestsBuffer.activeQueueSize()).isEqualTo(0);
+        assertThat(scheduledFuture).isEqualTo(aec.stateRequestsBuffer.currentScheduledFuture);
+        assertThat(scheduledFuture.isDone()).isTrue();
+        assertThat(aec.stateRequestsBuffer.currentSeq.get()).isEqualTo(2);
+        assertThat(aec.stateRequestsBuffer.scheduledSeq.get()).isEqualTo(1);
+    }
+
+    @Test
+    void testBufferTimeoutSkip() {
+        int batchSize = 3;
+        int timeout = 1000;
+        setup(
+                batchSize,
+                timeout,
+                1000,
+                new SyncMailboxExecutor(),
+                new TestAsyncFrameworkExceptionHandler());
+        ManuallyTriggeredScheduledExecutorService scheduledExecutor =
+                new ManuallyTriggeredScheduledExecutorService();
+        aec.stateRequestsBuffer.scheduledExecutor = scheduledExecutor;
+        Runnable userCode = () -> valueState.asyncValue();
+
+        assertThat(aec.stateRequestsBuffer.currentSeq.get()).isEqualTo(0);
+        assertThat(aec.stateRequestsBuffer.scheduledSeq.get()).isEqualTo(-1);
+        // register r1 timeout
+        RecordContext<String> recordContext = aec.buildContext("record1", "key1");
+        aec.setCurrentContext(recordContext);
+        userCode.run();
+        assertThat(aec.stateRequestsBuffer.activeQueueSize()).isEqualTo(1);
+        assertThat(aec.inFlightRecordNum.get()).isEqualTo(1);
+        assertThat(aec.stateRequestsBuffer.currentSeq.get()).isEqualTo(0);
+        assertThat(aec.stateRequestsBuffer.scheduledSeq.get()).isEqualTo(0);
+
+        // before r1 timeout execute, the active buffer size reach batch size.
+        RecordContext<String> recordContext2 = aec.buildContext("record2", "key2");
+        aec.setCurrentContext(recordContext2);
+        userCode.run();
+        assertThat(aec.stateRequestsBuffer.currentSeq.get()).isEqualTo(0);
+        assertThat(aec.stateRequestsBuffer.scheduledSeq.get()).isEqualTo(0);
+        RecordContext<String> recordContext3 = aec.buildContext("record3", "key3");
+        aec.setCurrentContext(recordContext3);
+        userCode.run();
+        assertThat(aec.stateRequestsBuffer.activeQueueSize()).isEqualTo(0);
+        assertThat(aec.stateRequestsBuffer.currentSeq.get()).isEqualTo(1);
+        assertThat(aec.stateRequestsBuffer.scheduledSeq.get()).isEqualTo(0);
+
+        // r1 timeout executes, but r1 is already triggered in [r1,r2,r3], so r1 timeout should skip
+        assertThat(scheduledExecutor.getActiveNonPeriodicScheduledTask().size()).isEqualTo(1);
+        assertThat(scheduledExecutor.getAllNonPeriodicScheduledTask().size()).isEqualTo(1);
+        scheduledExecutor.triggerNonPeriodicScheduledTask();
+        assertThat(aec.stateRequestsBuffer.currentScheduledFuture.isDone()).isTrue();
+        assertThat(aec.stateRequestsBuffer.currentSeq.get()).isEqualTo(1);
+        assertThat(aec.stateRequestsBuffer.scheduledSeq.get()).isEqualTo(0);
+
+        RecordContext<String> recordContext4 = aec.buildContext("record4", "key4");
+        aec.setCurrentContext(recordContext4);
+        userCode.run();
+
+        // register r4 timeout, set new currentScheduledFuture
+        assertThat(scheduledExecutor.getActiveNonPeriodicScheduledTask().size()).isEqualTo(1);
+        assertThat(aec.stateRequestsBuffer.activeQueueSize()).isEqualTo(1);
+        assertThat(aec.inFlightRecordNum.get()).isEqualTo(1);
+        assertThat(aec.stateRequestsBuffer.currentScheduledFuture.isDone()).isFalse();
+        assertThat(aec.stateRequestsBuffer.currentScheduledFuture.isCancelled()).isFalse();
+        assertThat(aec.stateRequestsBuffer.currentSeq.get()).isEqualTo(1);
+        assertThat(aec.stateRequestsBuffer.scheduledSeq.get()).isEqualTo(1);
+
+        // r4 timeout
+        scheduledExecutor.triggerNonPeriodicScheduledTask();
+        assertThat(aec.stateRequestsBuffer.activeQueueSize()).isEqualTo(0);
+        assertThat(aec.inFlightRecordNum.get()).isEqualTo(0);
+        assertThat(aec.stateRequestsBuffer.currentSeq.get()).isEqualTo(2);
+        assertThat(aec.stateRequestsBuffer.scheduledSeq.get()).isEqualTo(1);
+        assertThat(aec.stateRequestsBuffer.currentScheduledFuture.isDone()).isTrue();
+    }
+
+    @Test
+    void testUserCodeException() {
+        TestAsyncFrameworkExceptionHandler exceptionHandler =
+                new TestAsyncFrameworkExceptionHandler();
+        TestMailboxExecutor testMailboxExecutor = new TestMailboxExecutor(false);
+        setup(1000, 10000, 6000, testMailboxExecutor, exceptionHandler);
+        Runnable userCode =
+                () -> {
+                    valueState
+                            .asyncValue()
+                            .thenAccept(
+                                    val -> {
+                                        throw new FlinkRuntimeException(
+                                                "Artificial exception in user code");
+                                    });
+                };
+        String record = "record";
+        String key = "key";
+        RecordContext<String> recordContext = aec.buildContext(record, key);
+        aec.setCurrentContext(recordContext);
+        userCode.run();
+        assertThat(aec.inFlightRecordNum.get()).isEqualTo(1);
+        assertThat(aec.stateRequestsBuffer.activeQueueSize()).isEqualTo(1);
+        assertThat(aec.stateRequestsBuffer.blockingQueueSize()).isEqualTo(0);
+        assertThat(exceptionHandler.exception).isNull();
+        assertThat(exceptionHandler.message).isNull();
+        aec.triggerIfNeeded(true);
+        assertThat(aec.inFlightRecordNum.get()).isEqualTo(1);
+        assertThat(aec.stateRequestsBuffer.activeQueueSize()).isEqualTo(0);
+        assertThat(testMailboxExecutor.lastException).isInstanceOf(FlinkRuntimeException.class);
+        assertThat(testMailboxExecutor.lastException.getMessage())
+                .isEqualTo("Artificial exception in user code");
+        assertThat(exceptionHandler.exception).isNull();
+        assertThat(exceptionHandler.message).isNull();
+    }
+
+    @Test
+    void testFrameworkException() {
+        TestAsyncFrameworkExceptionHandler exceptionHandler =
+                new TestAsyncFrameworkExceptionHandler();
+        TestMailboxExecutor testMailboxExecutor = new TestMailboxExecutor(true);
+        setup(1000, 10000, 6000, testMailboxExecutor, exceptionHandler);
+        Runnable userCode = () -> valueState.asyncValue().thenAccept(val -> {});
+        String record = "record";
+        String key = "key";
+        RecordContext<String> recordContext = aec.buildContext(record, key);
+        aec.setCurrentContext(recordContext);
+        userCode.run();
+        assertThat(aec.inFlightRecordNum.get()).isEqualTo(1);
+        assertThat(aec.stateRequestsBuffer.activeQueueSize()).isEqualTo(1);
+        assertThat(aec.stateRequestsBuffer.blockingQueueSize()).isEqualTo(0);
+        assertThat(exceptionHandler.exception).isNull();
+        assertThat(exceptionHandler.message).isNull();
+        aec.triggerIfNeeded(true);
+        assertThat(testMailboxExecutor.lastException).isNull();
+        assertThat(exceptionHandler.exception).isInstanceOf(RuntimeException.class);
+        assertThat(exceptionHandler.exception.getMessage())
+                .isEqualTo("java.lang.RuntimeException: Fail to execute.");
+        assertThat(exceptionHandler.message)
+                .isEqualTo("Caught exception when submitting StateFuture's callback.");
     }
 
     /** Simulate the underlying state that is actually used to execute the request. */
@@ -375,50 +611,12 @@ class AsyncExecutionControllerTest {
         private final TestUnderlyingState underlyingState;
 
         public TestValueState(
-                AsyncExecutionController<String> aec, TestUnderlyingState underlyingState) {
-            super(aec, new ValueStateDescriptor<>("test-value-state", BasicTypeInfo.INT_TYPE_INFO));
+                StateRequestHandler stateRequestHandler,
+                TestUnderlyingState underlyingState,
+                ValueStateDescriptor<Integer> stateDescriptor) {
+            super(stateRequestHandler, stateDescriptor);
             this.underlyingState = underlyingState;
             assertThat(this.getValueSerializer()).isEqualTo(IntSerializer.INSTANCE);
-        }
-    }
-
-    /**
-     * A brief implementation of {@link StateBackend} which illustrates the interaction between AEC
-     * and StateBackend.
-     */
-    static class TestAsyncStateBackend implements StateBackend {
-
-        @Override
-        public <K> CheckpointableKeyedStateBackend<K> createKeyedStateBackend(
-                KeyedStateBackendParameters<K> parameters) throws Exception {
-            throw new UnsupportedOperationException("Don't support createKeyedStateBackend yet");
-        }
-
-        @Override
-        public OperatorStateBackend createOperatorStateBackend(
-                OperatorStateBackendParameters parameters) throws Exception {
-            throw new UnsupportedOperationException("Don't support createOperatorStateBackend yet");
-        }
-
-        @Override
-        public boolean supportsAsyncKeyedStateBackend() {
-            return true;
-        }
-
-        @Override
-        public <K> AsyncKeyedStateBackend createAsyncKeyedStateBackend(
-                KeyedStateBackendParameters<K> parameters) {
-            return new AsyncKeyedStateBackend() {
-                @Override
-                public StateExecutor createStateExecutor() {
-                    return new TestStateExecutor();
-                }
-
-                @Override
-                public void dispose() {
-                    // do nothing
-                }
-            };
         }
     }
 
@@ -432,10 +630,12 @@ class AsyncExecutionControllerTest {
 
         @Override
         @SuppressWarnings({"unchecked", "rawtypes"})
-        public CompletableFuture<Boolean> executeBatchRequests(
-                Iterable<StateRequest<?, ?, ?>> processingRequests) {
-            CompletableFuture<Boolean> future = new CompletableFuture<>();
-            for (StateRequest request : processingRequests) {
+        public CompletableFuture<Void> executeBatchRequests(
+                StateRequestContainer stateRequestContainer) {
+            Preconditions.checkArgument(stateRequestContainer instanceof MockStateRequestContainer);
+            CompletableFuture<Void> future = new CompletableFuture<>();
+            for (StateRequest request :
+                    ((MockStateRequestContainer) stateRequestContainer).getStateRequestList()) {
                 if (request.getRequestType() == StateRequestType.VALUE_GET) {
                     Preconditions.checkState(request.getState() != null);
                     TestValueState state = (TestValueState) request.getState();
@@ -454,8 +654,59 @@ class AsyncExecutionControllerTest {
                     throw new UnsupportedOperationException("Unsupported request type");
                 }
             }
-            future.complete(true);
+            future.complete(null);
             return future;
+        }
+
+        @Override
+        public StateRequestContainer createStateRequestContainer() {
+            return new MockStateRequestContainer();
+        }
+
+        @Override
+        public void shutdown() {}
+    }
+
+    static class TestAsyncFrameworkExceptionHandler implements AsyncFrameworkExceptionHandler {
+        String message = null;
+        Throwable exception = null;
+
+        public void handleException(String message, Throwable exception) {
+            this.message = message;
+            this.exception = exception;
+        }
+    }
+
+    static class TestMailboxExecutor implements MailboxExecutor {
+        Exception lastException = null;
+
+        boolean failWhenExecute = false;
+
+        public TestMailboxExecutor(boolean fail) {
+            this.failWhenExecute = fail;
+        }
+
+        @Override
+        public void execute(
+                ThrowingRunnable<? extends Exception> command,
+                String descriptionFormat,
+                Object... descriptionArgs) {
+            if (failWhenExecute) {
+                throw new RuntimeException("Fail to execute.");
+            }
+            try {
+                command.run();
+            } catch (Exception e) {
+                this.lastException = e;
+            }
+        }
+
+        @Override
+        public void yield() throws InterruptedException, FlinkRuntimeException {}
+
+        @Override
+        public boolean tryYield() throws FlinkRuntimeException {
+            return false;
         }
     }
 }
