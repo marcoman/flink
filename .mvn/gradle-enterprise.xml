@@ -13,10 +13,10 @@
   </buildScan>
   <buildCache>
     <local>
-      <enabled>false</enabled>
+      <enabled>true</enabled>
     </local>
     <remote>
-      <enabled>false</enabled>
+      <enabled>true</enabled>
       <server>
         <allowInsecureProtocol>true</allowInsecureProtocol>
       </server>
