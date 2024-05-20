@@ -18,6 +18,9 @@
 
 package org.apache.flink.runtime.state.v2;
 
+import org.apache.flink.api.common.state.v2.ListState;
+import org.apache.flink.api.common.state.v2.MapState;
+import org.apache.flink.api.common.state.v2.ReducingState;
 import org.apache.flink.api.common.state.v2.ValueState;
 import org.apache.flink.runtime.state.AsyncKeyedStateBackend;
 import org.apache.flink.util.Preconditions;
@@ -35,6 +38,38 @@ public class DefaultKeyedStateStoreV2 implements KeyedStateStoreV2 {
 
     @Override
     public <T> ValueState<T> getValueState(@Nonnull ValueStateDescriptor<T> stateProperties) {
+        Preconditions.checkNotNull(stateProperties, "The state properties must not be null");
+        try {
+            return asyncKeyedStateBackend.createState(stateProperties);
+        } catch (Exception e) {
+            throw new RuntimeException("Error while getting state", e);
+        }
+    }
+
+    @Override
+    public <T> ListState<T> getListState(@Nonnull ListStateDescriptor<T> stateProperties) {
+        Preconditions.checkNotNull(stateProperties, "The state properties must not be null");
+        try {
+            return asyncKeyedStateBackend.createState(stateProperties);
+        } catch (Exception e) {
+            throw new RuntimeException("Error while getting state", e);
+        }
+    }
+
+    @Override
+    public <UK, UV> MapState<UK, UV> getMapState(
+            @Nonnull MapStateDescriptor<UK, UV> stateProperties) {
+        Preconditions.checkNotNull(stateProperties, "The state properties must not be null");
+        try {
+            return asyncKeyedStateBackend.createState(stateProperties);
+        } catch (Exception e) {
+            throw new RuntimeException("Error while getting state", e);
+        }
+    }
+
+    @Override
+    public <T> ReducingState<T> getReducingState(
+            @Nonnull ReducingStateDescriptor<T> stateProperties) {
         Preconditions.checkNotNull(stateProperties, "The state properties must not be null");
         try {
             return asyncKeyedStateBackend.createState(stateProperties);

@@ -24,7 +24,13 @@ import org.apache.flink.table.api.ValidationException;
 import org.apache.flink.table.catalog.CatalogMaterializedTable;
 import org.apache.flink.table.catalog.ResolvedCatalogMaterializedTable;
 import org.apache.flink.table.operations.Operation;
+import org.apache.flink.table.operations.materializedtable.AlterMaterializedTableRefreshOperation;
+import org.apache.flink.table.operations.materializedtable.AlterMaterializedTableResumeOperation;
+import org.apache.flink.table.operations.materializedtable.AlterMaterializedTableSuspendOperation;
 import org.apache.flink.table.operations.materializedtable.CreateMaterializedTableOperation;
+import org.apache.flink.table.operations.materializedtable.DropMaterializedTableOperation;
+
+import org.apache.flink.shaded.guava31.com.google.common.collect.ImmutableMap;
 
 import org.junit.jupiter.api.Test;
 
@@ -42,7 +48,7 @@ public class SqlMaterializedTableNodeToOperationConverterTest
         extends SqlNodeToOperationConversionTestBase {
 
     @Test
-    public void testCreateMaterializedTable() {
+    void testCreateMaterializedTable() {
         final String sql =
                 "CREATE MATERIALIZED TABLE mtbl1 (\n"
                         + "   CONSTRAINT ct1 PRIMARY KEY(a) NOT ENFORCED"
@@ -93,7 +99,7 @@ public class SqlMaterializedTableNodeToOperationConverterTest
     }
 
     @Test
-    public void testContinuousRefreshMode() {
+    void testContinuousRefreshMode() {
         // test continuous mode derived by specify freshness automatically
         final String sql =
                 "CREATE MATERIALIZED TABLE mtbl1\n"
@@ -131,7 +137,7 @@ public class SqlMaterializedTableNodeToOperationConverterTest
     }
 
     @Test
-    public void testFullRefreshMode() {
+    void testFullRefreshMode() {
         // test full mode derived by specify freshness automatically
         final String sql =
                 "CREATE MATERIALIZED TABLE mtbl1\n"
@@ -169,7 +175,7 @@ public class SqlMaterializedTableNodeToOperationConverterTest
     }
 
     @Test
-    public void testCreateMaterializedTableWithInvalidPrimaryKey() {
+    void testCreateMaterializedTableWithInvalidPrimaryKey() {
         // test unsupported constraint
         final String sql =
                 "CREATE MATERIALIZED TABLE mtbl1 (\n"
@@ -210,7 +216,7 @@ public class SqlMaterializedTableNodeToOperationConverterTest
     }
 
     @Test
-    public void testCreateMaterializedTableWithInvalidPartitionKey() {
+    void testCreateMaterializedTableWithInvalidPartitionKey() {
         final String sql =
                 "CREATE MATERIALIZED TABLE mtbl1\n"
                         + "PARTITIONED BY (a, e)\n"
@@ -224,7 +230,7 @@ public class SqlMaterializedTableNodeToOperationConverterTest
     }
 
     @Test
-    public void testCreateMaterializedTableWithInvalidFreshnessType() {
+    void testCreateMaterializedTableWithInvalidFreshnessType() {
         // test negative freshness value
         final String sql =
                 "CREATE MATERIALIZED TABLE mtbl1\n"
@@ -255,5 +261,76 @@ public class SqlMaterializedTableNodeToOperationConverterTest
                 .isInstanceOf(ValidationException.class)
                 .hasMessageContaining(
                         "Materialized table freshness only support SECOND, MINUTE, HOUR, DAY as the time unit.");
+    }
+
+    @Test
+    void testAlterMaterializedTableRefreshOperationWithPartitionSpec() {
+        final String sql =
+                "ALTER MATERIALIZED TABLE mtbl1 REFRESH PARTITION (ds1 = '1', ds2 = '2')";
+
+        Operation operation = parse(sql);
+        assertThat(operation).isInstanceOf(AlterMaterializedTableRefreshOperation.class);
+
+        AlterMaterializedTableRefreshOperation op =
+                (AlterMaterializedTableRefreshOperation) operation;
+        assertThat(op.getTableIdentifier().toString()).isEqualTo("`builtin`.`default`.`mtbl1`");
+        assertThat(op.getPartitionSpec()).isEqualTo(ImmutableMap.of("ds1", "1", "ds2", "2"));
+    }
+
+    @Test
+    public void testAlterMaterializedTableRefreshOperationWithoutPartitionSpec() {
+        final String sql = "ALTER MATERIALIZED TABLE mtbl1 REFRESH";
+
+        Operation operation = parse(sql);
+        assertThat(operation).isInstanceOf(AlterMaterializedTableRefreshOperation.class);
+
+        AlterMaterializedTableRefreshOperation op =
+                (AlterMaterializedTableRefreshOperation) operation;
+        assertThat(op.getTableIdentifier().toString()).isEqualTo("`builtin`.`default`.`mtbl1`");
+        assertThat(op.getPartitionSpec()).isEmpty();
+    }
+
+    @Test
+    void testAlterMaterializedTableSuspend() {
+        final String sql = "ALTER MATERIALIZED TABLE mtbl1 SUSPEND";
+        Operation operation = parse(sql);
+        assertThat(operation).isInstanceOf(AlterMaterializedTableSuspendOperation.class);
+    }
+
+    @Test
+    void testAlterMaterializedTableResume() {
+        final String sql1 = "ALTER MATERIALIZED TABLE mtbl1 RESUME";
+        Operation operation = parse(sql1);
+        assertThat(operation).isInstanceOf(AlterMaterializedTableResumeOperation.class);
+        assertThat(operation.asSummaryString())
+                .isEqualTo("ALTER MATERIALIZED TABLE builtin.default.mtbl1 RESUME");
+
+        final String sql2 = "ALTER MATERIALIZED TABLE mtbl1 RESUME WITH ('k1' = 'v1')";
+        Operation operation2 = parse(sql2);
+        assertThat(operation2).isInstanceOf(AlterMaterializedTableResumeOperation.class);
+        assertThat(((AlterMaterializedTableResumeOperation) operation2).getDynamicOptions())
+                .containsEntry("k1", "v1");
+        assertThat(operation2.asSummaryString())
+                .isEqualTo("ALTER MATERIALIZED TABLE builtin.default.mtbl1 RESUME WITH (k1: [v1])");
+    }
+
+    @Test
+    void testDropMaterializedTable() {
+        final String sql = "DROP MATERIALIZED TABLE mtbl1";
+        Operation operation = parse(sql);
+        assertThat(operation).isInstanceOf(DropMaterializedTableOperation.class);
+        assertThat(((DropMaterializedTableOperation) operation).isIfExists()).isFalse();
+        assertThat(operation.asSummaryString())
+                .isEqualTo(
+                        "DROP MATERIALIZED TABLE: (identifier: [`builtin`.`default`.`mtbl1`], IfExists: [false])");
+
+        final String sql2 = "DROP MATERIALIZED TABLE IF EXISTS mtbl1";
+        Operation operation2 = parse(sql2);
+        assertThat(operation2).isInstanceOf(DropMaterializedTableOperation.class);
+        assertThat(((DropMaterializedTableOperation) operation2).isIfExists()).isTrue();
+
+        assertThat(operation2.asSummaryString())
+                .isEqualTo(
+                        "DROP MATERIALIZED TABLE: (identifier: [`builtin`.`default`.`mtbl1`], IfExists: [true])");
     }
 }
