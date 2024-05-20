@@ -148,6 +148,28 @@ SqlDrop SqlDropCatalog(Span s, boolean replace) :
 }
 
 /**
+* Parses an alter catalog statement.
+* ALTER CATALOG catalog_name SET (key1=val1, key2=val2, ...);
+*/
+SqlAlterCatalog SqlAlterCatalog() :
+{
+    SqlParserPos startPos;
+    SqlIdentifier catalogName;
+    SqlNodeList propertyList = SqlNodeList.EMPTY;
+}
+{
+    <ALTER> <CATALOG> { startPos = getPos(); }
+    catalogName = SimpleIdentifier()
+    <SET>
+    propertyList = TableProperties()
+    {
+        return new SqlAlterCatalogOptions(startPos.plus(getPos()),
+                    catalogName,
+                    propertyList);
+    }
+}
+
+/**
 * Parse a "Show DATABASES" metadata query command.
 */
 SqlShowDatabases SqlShowDatabases() :
@@ -1780,6 +1802,34 @@ SqlCreate SqlCreateMaterializedTable(Span s, boolean replace, boolean isTemporar
 }
 
 /**
+* Parses a DROP MATERIALIZED TABLE statement.
+*/
+SqlDrop SqlDropMaterializedTable(Span s, boolean replace, boolean isTemporary) :
+{
+    SqlIdentifier tableName = null;
+    boolean ifExists = false;
+}
+{
+    <MATERIALIZED>
+     {
+         if (isTemporary) {
+             throw SqlUtil.newContextException(
+                 getPos(),
+                 ParserResource.RESOURCE.dropTemporaryMaterializedTableUnsupported());
+         }
+     }
+     <TABLE>
+
+    ifExists = IfExistsOpt()
+
+    tableName = CompoundIdentifier()
+
+    {
+        return new SqlDropMaterializedTable(s.pos(), tableName, ifExists);
+    }
+}
+
+/**
 * Parses alter materialized table.
 */
 SqlAlterMaterializedTable SqlAlterMaterializedTable() :
@@ -2404,6 +2454,8 @@ SqlDrop SqlDropExtended(Span s, boolean replace) :
     ]
     (
         drop = SqlDropCatalog(s, replace)
+        |
+        drop = SqlDropMaterializedTable(s, replace, isTemporary)
         |
         drop = SqlDropTable(s, replace, isTemporary)
         |
