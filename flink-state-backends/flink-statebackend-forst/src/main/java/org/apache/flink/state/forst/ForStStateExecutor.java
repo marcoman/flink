@@ -21,7 +21,6 @@ package org.apache.flink.state.forst;
 import org.apache.flink.runtime.asyncprocessing.StateExecutor;
 import org.apache.flink.runtime.asyncprocessing.StateRequest;
 import org.apache.flink.runtime.asyncprocessing.StateRequestContainer;
-import org.apache.flink.util.FlinkRuntimeException;
 import org.apache.flink.util.Preconditions;
 import org.apache.flink.util.concurrent.ExecutorThreadFactory;
 import org.apache.flink.util.concurrent.FutureUtils;
@@ -34,7 +33,6 @@ import org.slf4j.LoggerFactory;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -60,6 +58,8 @@ public class ForStStateExecutor implements StateExecutor {
 
     private final WriteOptions writeOptions;
 
+    private Throwable executionError;
+
     public ForStStateExecutor(int ioParallelism, RocksDB db, WriteOptions writeOptions) {
         this.coordinatorThread =
                 Executors.newSingleThreadScheduledExecutor(
@@ -74,10 +74,12 @@ public class ForStStateExecutor implements StateExecutor {
     @Override
     public CompletableFuture<Void> executeBatchRequests(
             StateRequestContainer stateRequestContainer) {
+        checkState();
         Preconditions.checkArgument(stateRequestContainer instanceof ForStStateRequestClassifier);
         ForStStateRequestClassifier stateRequestClassifier =
                 (ForStStateRequestClassifier) stateRequestContainer;
-        return CompletableFuture.supplyAsync(
+        CompletableFuture<Void> resultFuture = new CompletableFuture<>();
+        coordinatorThread.execute(
                 () -> {
                     long startTime = System.currentTimeMillis();
                     List<CompletableFuture<Void>> futures = new ArrayList<>(2);
@@ -98,27 +100,39 @@ public class ForStStateExecutor implements StateExecutor {
                         futures.add(getOperations.process());
                     }
 
-                    try {
-                        FutureUtils.waitForAll(futures).get();
-                    } catch (InterruptedException | ExecutionException e) {
-                        throw new FlinkRuntimeException(
-                                "Exception when executing ForSt writeBatch or multiGet operation",
-                                e);
-                    }
-                    long duration = System.currentTimeMillis() - startTime;
-                    LOG.debug(
-                            "Complete executing a batch of state requests, putRequest size {}, getRequest size {}, duration {} ms",
-                            putRequests.size(),
-                            getRequests.size(),
-                            duration);
-                    return null;
-                },
-                coordinatorThread);
+                    FutureUtils.combineAll(futures)
+                            .thenAcceptAsync(
+                                    (e) -> {
+                                        long duration = System.currentTimeMillis() - startTime;
+                                        LOG.debug(
+                                                "Complete executing a batch of state requests, putRequest size {}, getRequest size {}, duration {} ms",
+                                                putRequests.size(),
+                                                getRequests.size(),
+                                                duration);
+                                        resultFuture.complete(null);
+                                    },
+                                    coordinatorThread)
+                            .exceptionally(
+                                    e -> {
+                                        executionError = e;
+                                        resultFuture.completeExceptionally(e);
+                                        return null;
+                                    });
+                });
+        return resultFuture;
     }
 
     @Override
     public StateRequestContainer createStateRequestContainer() {
+        checkState();
         return new ForStStateRequestClassifier();
+    }
+
+    private void checkState() {
+        if (executionError != null) {
+            throw new IllegalStateException(
+                    "previous state request already failed : ", executionError);
+        }
     }
 
     @Override

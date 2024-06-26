@@ -19,7 +19,7 @@
 package org.apache.flink.runtime.io.network.partition;
 
 import org.apache.flink.annotation.VisibleForTesting;
-import org.apache.flink.api.java.tuple.Tuple3;
+import org.apache.flink.configuration.NettyShuffleEnvironmentOptions.CompressionCodec;
 import org.apache.flink.runtime.deployment.ResultPartitionDeploymentDescriptor;
 import org.apache.flink.runtime.io.disk.BatchShuffleReadBufferPool;
 import org.apache.flink.runtime.io.disk.FileChannelManager;
@@ -30,12 +30,17 @@ import org.apache.flink.runtime.io.network.buffer.BufferPoolFactory;
 import org.apache.flink.runtime.io.network.partition.hybrid.HsResultPartition;
 import org.apache.flink.runtime.io.network.partition.hybrid.HybridShuffleConfiguration;
 import org.apache.flink.runtime.io.network.partition.hybrid.tiered.shuffle.TieredResultPartitionFactory;
+import org.apache.flink.runtime.io.network.partition.hybrid.tiered.storage.TieredStorageMemorySpec;
+import org.apache.flink.runtime.io.network.partition.hybrid.tiered.tier.TierFactory;
+import org.apache.flink.runtime.shuffle.NettyShuffleDescriptor;
 import org.apache.flink.runtime.shuffle.NettyShuffleUtils;
+import org.apache.flink.runtime.shuffle.ShuffleDescriptor;
 import org.apache.flink.util.ExceptionUtils;
 import org.apache.flink.util.FlinkRuntimeException;
 import org.apache.flink.util.ProcessorArchitecture;
 import org.apache.flink.util.function.SupplierWithException;
 
+import org.apache.commons.lang3.tuple.Pair;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -43,6 +48,9 @@ import java.io.File;
 import java.io.IOException;
 import java.util.Optional;
 import java.util.concurrent.ScheduledExecutorService;
+
+import static org.apache.flink.util.Preconditions.checkNotNull;
+import static org.apache.flink.util.Preconditions.checkState;
 
 /** Factory for {@link ResultPartition} to use in {@link NettyShuffleEnvironment}. */
 public class ResultPartitionFactory {
@@ -69,7 +77,7 @@ public class ResultPartitionFactory {
 
     private final boolean batchShuffleCompressionEnabled;
 
-    private final String compressionCodec;
+    private final CompressionCodec compressionCodec;
 
     private final int maxBuffersPerChannel;
 
@@ -98,7 +106,7 @@ public class ResultPartitionFactory {
             int floatingNetworkBuffersPerGate,
             int networkBufferSize,
             boolean batchShuffleCompressionEnabled,
-            String compressionCodec,
+            CompressionCodec compressionCodec,
             int maxBuffersPerChannel,
             int sortShuffleMinBuffers,
             int sortShuffleMinParallelism,
@@ -139,9 +147,11 @@ public class ResultPartitionFactory {
                 partitionIndex,
                 desc.getShuffleDescriptor().getResultPartitionID(),
                 desc.getPartitionType(),
+                desc.getTotalNumberOfPartitions(),
                 desc.getNumberOfSubpartitions(),
                 desc.getMaxParallelism(),
                 desc.isBroadcast(),
+                desc.getShuffleDescriptor(),
                 createBufferPoolFactory(desc.getNumberOfSubpartitions(), desc.getPartitionType()),
                 desc.isNumberOfPartitionConsumerUndefined());
     }
@@ -152,14 +162,21 @@ public class ResultPartitionFactory {
             int partitionIndex,
             ResultPartitionID id,
             ResultPartitionType type,
+            int numberOfPartitions,
             int numberOfSubpartitions,
             int maxParallelism,
             boolean isBroadcast,
+            ShuffleDescriptor shuffleDescriptor,
             SupplierWithException<BufferPool, IOException> bufferPoolFactory,
             boolean isNumberOfPartitionConsumerUndefined) {
         BufferCompressor bufferCompressor = null;
         if (type.supportCompression() && batchShuffleCompressionEnabled) {
             bufferCompressor = new BufferCompressor(networkBufferSize, compressionCodec);
+        }
+        if (tieredStorage.isPresent() && type == ResultPartitionType.BLOCKING) {
+            LOG.warn(
+                    "When enabling tiered storage, the BLOCKING result partition will be replaced as HYBRID_FULL.");
+            type = ResultPartitionType.HYBRID_FULL;
         }
 
         ResultSubpartition[] subpartitions = new ResultSubpartition[numberOfSubpartitions];
@@ -235,6 +252,7 @@ public class ResultPartitionFactory {
             }
         } else if (type == ResultPartitionType.HYBRID_FULL
                 || type == ResultPartitionType.HYBRID_SELECTIVE) {
+            checkState(shuffleDescriptor instanceof NettyShuffleDescriptor);
             if (tieredStorage.isPresent()) {
                 partition =
                         tieredStorage
@@ -244,11 +262,16 @@ public class ResultPartitionFactory {
                                         partitionIndex,
                                         id,
                                         type,
+                                        numberOfPartitions,
                                         subpartitions.length,
                                         maxParallelism,
+                                        networkBufferSize,
                                         isBroadcast,
                                         partitionManager,
                                         bufferCompressor,
+                                        checkNotNull(
+                                                ((NettyShuffleDescriptor) shuffleDescriptor)
+                                                        .getTierShuffleDescriptors()),
                                         bufferPoolFactory,
                                         channelManager,
                                         batchShuffleReadBufferPool,
@@ -360,7 +383,7 @@ public class ResultPartitionFactory {
     SupplierWithException<BufferPool, IOException> createBufferPoolFactory(
             int numberOfSubpartitions, ResultPartitionType type) {
         return () -> {
-            Tuple3<Integer, Integer, Integer> tuple =
+            Pair<Integer, Integer> pair =
                     NettyShuffleUtils.getMinMaxNetworkBuffersPerResultPartition(
                             configuredNetworkBuffersPerChannel,
                             floatingNetworkBuffersPerGate,
@@ -369,29 +392,13 @@ public class ResultPartitionFactory {
                             numberOfSubpartitions,
                             tieredStorage.isPresent(),
                             tieredStorage
-                                    .map(
-                                            storage ->
-                                                    storage.getTieredStorageConfiguration()
-                                                            .getMemoryDecouplingEnabled())
-                                    .orElse(false),
-                            tieredStorage
-                                    .map(
-                                            storage ->
-                                                    storage.getTieredStorageConfiguration()
-                                                            .getTotalExclusiveBufferNum())
-                                    .orElse(0),
-                            tieredStorage
-                                    .map(
-                                            storage ->
-                                                    storage.getTieredStorageConfiguration()
-                                                            .getMinBuffersPerResultPartition())
+                                    .map(ResultPartitionFactory::getNumTotalGuaranteedBuffers)
                                     .orElse(0),
                             type);
 
             return bufferPoolFactory.createBufferPool(
-                    tuple.f0,
-                    tuple.f1,
-                    tuple.f2,
+                    pair.getLeft(),
+                    pair.getRight(),
                     numberOfSubpartitions,
                     maxBuffersPerChannel,
                     isOverdraftBufferNeeded(type) ? maxOverdraftBuffersPerGate : 0);
@@ -408,5 +415,14 @@ public class ResultPartitionFactory {
                 LOG.warn("Cannot determine memory architecture. Using pure file-based shuffle.");
                 return BoundedBlockingSubpartitionType.FILE;
         }
+    }
+
+    private static int getNumTotalGuaranteedBuffers(
+            TieredResultPartitionFactory resultPartitionFactory) {
+        return resultPartitionFactory.getTieredStorageConfiguration().getTierFactories().stream()
+                .map(TierFactory::getProducerAgentMemorySpec)
+                .map(TieredStorageMemorySpec::getNumGuaranteedBuffers)
+                .mapToInt(Integer::intValue)
+                .sum();
     }
 }

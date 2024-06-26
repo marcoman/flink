@@ -21,6 +21,7 @@ import org.apache.flink.annotation.Internal;
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.operators.MailboxExecutor;
 import org.apache.flink.api.common.operators.ProcessingTimeService.ProcessingTimeCallback;
+import org.apache.flink.configuration.CheckpointingOptions;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.TaskManagerOptions;
 import org.apache.flink.core.execution.RestoreMode;
@@ -79,7 +80,6 @@ import org.apache.flink.runtime.taskmanager.AsynchronousException;
 import org.apache.flink.runtime.taskmanager.DispatcherThreadFactory;
 import org.apache.flink.runtime.taskmanager.Task;
 import org.apache.flink.streaming.api.TimeCharacteristic;
-import org.apache.flink.streaming.api.environment.ExecutionCheckpointingOptions;
 import org.apache.flink.streaming.api.graph.NonChainedOutput;
 import org.apache.flink.streaming.api.graph.StreamConfig;
 import org.apache.flink.streaming.api.operators.InternalTimeServiceManager;
@@ -529,10 +529,11 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>>
                             configuration
                                     .getConfiguration()
                                     .get(
-                                            ExecutionCheckpointingOptions
+                                            CheckpointingOptions
                                                     .ENABLE_CHECKPOINTS_AFTER_TASKS_FINISH),
                             BarrierAlignmentUtil.createRegisterTimerCallback(
-                                    mainMailboxExecutor, systemTimerService));
+                                    mainMailboxExecutor, systemTimerService),
+                            environment.getTaskStateManager().getFileMergingSnapshotManager());
             resourceCloser.registerCloseable(subtaskCheckpointCoordinator::close);
 
             // Register to stop all timers and threads. Should be closed first.
@@ -567,6 +568,12 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>>
                             checkpointStorageAccess.toFileMergingStorage(
                                     fileMergingSnapshotManager, environment);
             mergingCheckpointStorageAccess.initializeBaseLocationsForCheckpoint();
+            if (mergingCheckpointStorageAccess instanceof FsMergingCheckpointStorageAccess) {
+                resourceCloser.registerCloseable(
+                        () ->
+                                ((FsMergingCheckpointStorageAccess) mergingCheckpointStorageAccess)
+                                        .close());
+            }
             return mergingCheckpointStorageAccess;
         } catch (IOException e) {
             LOG.warn(
@@ -948,6 +955,11 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>>
     }
 
     @VisibleForTesting
+    public boolean runSingleMailboxLoop() throws Exception {
+        return mailboxProcessor.runSingleMailboxLoop();
+    }
+
+    @VisibleForTesting
     public boolean runMailboxStep() throws Exception {
         return mailboxProcessor.runMailboxStep();
     }
@@ -1036,7 +1048,7 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>>
     private boolean areCheckpointsWithFinishedTasksEnabled() {
         return configuration
                         .getConfiguration()
-                        .get(ExecutionCheckpointingOptions.ENABLE_CHECKPOINTS_AFTER_TASKS_FINISH)
+                        .get(CheckpointingOptions.ENABLE_CHECKPOINTS_AFTER_TASKS_FINISH)
                 && configuration.isCheckpointingEnabled();
     }
 
@@ -1117,6 +1129,10 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>>
 
     public MailboxExecutorFactory getMailboxExecutorFactory() {
         return this.mailboxProcessor::getMailboxExecutor;
+    }
+
+    public boolean hasMail() {
+        return mailboxProcessor.hasMail();
     }
 
     private boolean taskIsAvailable() {
@@ -1564,7 +1580,8 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>>
                 getEnvironment()
                         .getTaskManagerInfo()
                         .getConfiguration()
-                        .get(TaskManagerOptions.TASK_CANCELLATION_TIMEOUT_TIMERS);
+                        .get(TaskManagerOptions.TASK_CANCELLATION_TIMEOUT_TIMERS)
+                        .toMillis();
         tryShutdownTimerService(timeoutMs, timerService);
         tryShutdownTimerService(timeoutMs, systemTimerService);
     }

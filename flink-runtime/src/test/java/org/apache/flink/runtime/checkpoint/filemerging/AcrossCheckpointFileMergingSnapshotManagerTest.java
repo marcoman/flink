@@ -20,11 +20,12 @@ package org.apache.flink.runtime.checkpoint.filemerging;
 import org.apache.flink.core.fs.CloseableRegistry;
 import org.apache.flink.runtime.state.CheckpointedStateScope;
 import org.apache.flink.runtime.state.filemerging.SegmentFileStateHandle;
-import org.apache.flink.runtime.state.filesystem.FileMergingCheckpointStateOutputStream;
+import org.apache.flink.util.function.BiFunctionWithException;
 
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
+import java.util.Collections;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -159,40 +160,144 @@ public class AcrossCheckpointFileMergingSnapshotManagerTest
                         (FileMergingSnapshotManagerBase)
                                 createFileMergingSnapshotManager(checkpointBaseDir);
                 CloseableRegistry closeableRegistry = new CloseableRegistry()) {
-            FileMergingCheckpointStateOutputStream cp1Stream =
-                    writeCheckpointAndGetStream(1, fmsm, closeableRegistry);
-            SegmentFileStateHandle cp1StateHandle = cp1Stream.closeAndGetHandle();
+            fmsm.registerSubtaskForSharedStates(subtaskKey1);
+            fmsm.registerSubtaskForSharedStates(subtaskKey2);
+            BiFunctionWithException<
+                            FileMergingSnapshotManager.SubtaskKey,
+                            Long,
+                            SegmentFileStateHandle,
+                            Exception>
+                    writer =
+                            ((subtaskKey, checkpointId) -> {
+                                return writeCheckpointAndGetStream(
+                                                subtaskKey,
+                                                checkpointId,
+                                                CheckpointedStateScope.SHARED,
+                                                fmsm,
+                                                closeableRegistry)
+                                        .closeAndGetHandle();
+                            });
+
+            SegmentFileStateHandle cp1StateHandle1 = writer.apply(subtaskKey1, 1L);
+            SegmentFileStateHandle cp1StateHandle2 = writer.apply(subtaskKey2, 1L);
             fmsm.notifyCheckpointComplete(subtaskKey1, 1);
-            assertFileInManagedDir(fmsm, cp1StateHandle);
-            assertThat(fmsm.spaceStat.physicalFileCount.get()).isEqualTo(1);
-            assertThat(fmsm.spaceStat.logicalFileCount.get()).isEqualTo(1);
-            // complete checkpoint-2
-            FileMergingCheckpointStateOutputStream cp2Stream =
-                    writeCheckpointAndGetStream(2, fmsm, closeableRegistry);
-            SegmentFileStateHandle cp2StateHandle = cp2Stream.closeAndGetHandle();
-            fmsm.notifyCheckpointComplete(subtaskKey1, 2);
-            assertFileInManagedDir(fmsm, cp2StateHandle);
-            assertThat(fmsm.spaceStat.physicalFileCount.get()).isEqualTo(1);
+            assertFileInManagedDir(fmsm, cp1StateHandle1);
+            assertFileInManagedDir(fmsm, cp1StateHandle2);
+            assertThat(fmsm.spaceStat.physicalFileCount.get()).isEqualTo(2);
             assertThat(fmsm.spaceStat.logicalFileCount.get()).isEqualTo(2);
+
+            // complete checkpoint-2
+            SegmentFileStateHandle cp2StateHandle1 = writer.apply(subtaskKey1, 2L);
+            SegmentFileStateHandle cp2StateHandle2 = writer.apply(subtaskKey2, 2L);
+            fmsm.notifyCheckpointComplete(subtaskKey1, 2);
+            fmsm.notifyCheckpointComplete(subtaskKey2, 2);
+            assertFileInManagedDir(fmsm, cp2StateHandle1);
+            assertFileInManagedDir(fmsm, cp2StateHandle2);
+            assertThat(fmsm.spaceStat.physicalFileCount.get()).isEqualTo(2);
+            assertThat(fmsm.spaceStat.logicalFileCount.get()).isEqualTo(4);
+
+            assertThat(fmsm.isCheckpointDiscard(1)).isFalse();
 
             // subsume checkpoint-1
-            assertThat(fileExists(cp1StateHandle)).isTrue();
+            assertThat(fileExists(cp1StateHandle1)).isTrue();
+            assertThat(fileExists(cp1StateHandle2)).isTrue();
             fmsm.notifyCheckpointSubsumed(subtaskKey1, 1);
-            assertThat(fileExists(cp1StateHandle)).isTrue();
-            assertThat(fmsm.spaceStat.physicalFileCount.get()).isEqualTo(1);
-            assertThat(fmsm.spaceStat.logicalFileCount.get()).isEqualTo(1);
+            assertThat(fileExists(cp1StateHandle1)).isTrue();
+            assertThat(fileExists(cp1StateHandle2)).isTrue();
+            assertThat(fmsm.spaceStat.physicalFileCount.get()).isEqualTo(2);
+            assertThat(fmsm.spaceStat.logicalFileCount.get()).isEqualTo(3);
+
+            assertThat(fmsm.isCheckpointDiscard(1)).isFalse();
+            fmsm.notifyCheckpointSubsumed(subtaskKey2, 1);
+            assertThat(fmsm.isCheckpointDiscard(1)).isTrue();
+            assertThat(fmsm.spaceStat.physicalFileCount.get()).isEqualTo(2);
+            assertThat(fmsm.spaceStat.logicalFileCount.get()).isEqualTo(2);
 
             // abort checkpoint-3
-            FileMergingCheckpointStateOutputStream cp3Stream =
-                    writeCheckpointAndGetStream(3, fmsm, closeableRegistry);
-            SegmentFileStateHandle cp3StateHandle = cp3Stream.closeAndGetHandle();
-            assertThat(fmsm.spaceStat.physicalFileCount.get()).isEqualTo(1);
-            assertThat(fmsm.spaceStat.logicalFileCount.get()).isEqualTo(2);
-            assertFileInManagedDir(fmsm, cp3StateHandle);
+            SegmentFileStateHandle cp3StateHandle1 = writer.apply(subtaskKey1, 3L);
+            SegmentFileStateHandle cp3StateHandle2 = writer.apply(subtaskKey2, 3L);
+            assertThat(fmsm.spaceStat.physicalFileCount.get()).isEqualTo(2);
+            assertThat(fmsm.spaceStat.logicalFileCount.get()).isEqualTo(4);
+            assertFileInManagedDir(fmsm, cp3StateHandle1);
+            assertFileInManagedDir(fmsm, cp3StateHandle2);
             fmsm.notifyCheckpointAborted(subtaskKey1, 3);
-            assertThat(fileExists(cp3StateHandle)).isTrue();
+            assertThat(fileExists(cp3StateHandle1)).isTrue();
+            assertThat(fmsm.spaceStat.physicalFileCount.get()).isEqualTo(2);
+            assertThat(fmsm.spaceStat.logicalFileCount.get()).isEqualTo(3);
+
+            assertThat(fmsm.isCheckpointDiscard(3)).isFalse();
+            fmsm.notifyCheckpointAborted(subtaskKey2, 3);
+            assertThat(fmsm.isCheckpointDiscard(3)).isTrue();
+            assertThat(fmsm.spaceStat.physicalFileCount.get()).isEqualTo(2);
+            assertThat(fmsm.spaceStat.logicalFileCount.get()).isEqualTo(2);
+        }
+    }
+
+    @Test
+    public void testSpaceControl() throws Exception {
+        try (FileMergingSnapshotManagerBase fmsm =
+                        (FileMergingSnapshotManagerBase)
+                                createFileMergingSnapshotManager(checkpointBaseDir);
+                CloseableRegistry closeableRegistry = new CloseableRegistry()) {
+
+            fmsm.registerSubtaskForSharedStates(subtaskKey1);
+
+            BiFunctionWithException<Long, Integer, SegmentFileStateHandle, Exception> writer =
+                    ((checkpointId, size) -> {
+                        return writeCheckpointAndGetStream(
+                                        subtaskKey1,
+                                        checkpointId,
+                                        CheckpointedStateScope.SHARED,
+                                        fmsm,
+                                        closeableRegistry,
+                                        size)
+                                .closeAndGetHandle();
+                    });
+            Integer eighthOfFile = 4 * 1024 * 1024;
+
+            // Doing checkpoint-1 with 6 files
+            SegmentFileStateHandle stateHandle1 = writer.apply(1L, eighthOfFile);
+            SegmentFileStateHandle stateHandle2 = writer.apply(1L, eighthOfFile);
+            SegmentFileStateHandle stateHandle3 = writer.apply(1L, eighthOfFile);
+            SegmentFileStateHandle stateHandle4 = writer.apply(1L, eighthOfFile);
+            SegmentFileStateHandle stateHandle5 = writer.apply(1L, eighthOfFile);
+            SegmentFileStateHandle stateHandle6 = writer.apply(1L, eighthOfFile);
+
+            fmsm.notifyCheckpointComplete(subtaskKey1, 1);
             assertThat(fmsm.spaceStat.physicalFileCount.get()).isEqualTo(1);
-            assertThat(fmsm.spaceStat.logicalFileCount.get()).isEqualTo(1);
+            assertThat(fmsm.spaceStat.logicalFileCount.get()).isEqualTo(6);
+
+            // complete checkpoint-2 with 3 files written and 1 file reused from checkpoint 1
+            assertThat(fmsm.couldReusePreviousStateHandle(stateHandle1)).isTrue();
+            SegmentFileStateHandle stateHandle7 = writer.apply(2L, eighthOfFile);
+            SegmentFileStateHandle stateHandle8 = writer.apply(2L, eighthOfFile);
+            SegmentFileStateHandle stateHandle9 = writer.apply(2L, eighthOfFile);
+            fmsm.reusePreviousStateHandle(2, Collections.singletonList(stateHandle1));
+            fmsm.notifyCheckpointComplete(subtaskKey1, 2);
+            assertThat(fmsm.spaceStat.physicalFileCount.get()).isEqualTo(2);
+            assertThat(fmsm.spaceStat.logicalFileCount.get()).isEqualTo(9);
+
+            // subsume checkpoint-1
+            fmsm.notifyCheckpointSubsumed(subtaskKey1, 1);
+            assertThat(fmsm.spaceStat.physicalFileCount.get()).isEqualTo(2);
+            assertThat(fmsm.spaceStat.logicalFileCount.get()).isEqualTo(4);
+
+            // complete checkpoint-3 with 1 files reuse from checkpoint 1 and 2.
+            assertThat(fmsm.couldReusePreviousStateHandle(stateHandle1)).isFalse();
+            assertThat(fmsm.couldReusePreviousStateHandle(stateHandle7)).isFalse();
+            assertThat(fmsm.couldReusePreviousStateHandle(stateHandle9)).isTrue();
+            SegmentFileStateHandle stateHandle10 = writer.apply(3L, eighthOfFile);
+            SegmentFileStateHandle stateHandle11 = writer.apply(3L, eighthOfFile);
+            SegmentFileStateHandle stateHandle12 = writer.apply(3L, eighthOfFile);
+
+            fmsm.notifyCheckpointComplete(subtaskKey1, 3);
+            assertThat(fmsm.spaceStat.physicalFileCount.get()).isEqualTo(2);
+            assertThat(fmsm.spaceStat.logicalFileCount.get()).isEqualTo(7);
+
+            // subsume checkpoint-2
+            fmsm.notifyCheckpointSubsumed(subtaskKey1, 2);
+            assertThat(fmsm.spaceStat.physicalFileCount.get()).isEqualTo(1);
+            assertThat(fmsm.spaceStat.logicalFileCount.get()).isEqualTo(3);
         }
     }
 }
